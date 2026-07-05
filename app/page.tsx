@@ -1,101 +1,441 @@
 "use client";
 
-import { useState } from "react";
-import SearchBar from "@/components/SearchBar";
-import MemeGrid from "@/components/MemeGrid";
-import Pagination from "@/components/Pagination";
-import { ContentType, MemeJob } from "@/lib/types";
+import { useMemo, useState } from "react";
+import CommentTreeView from "@/components/CommentTreeView";
+import {
+  CommentAnalysis,
+  CommentSectionResult,
+  FlatComment,
+} from "@/lib/types";
 
-export default function HomePage() {
-  const [query, setQuery] = useState("");
-  const [type, setType] = useState<ContentType>("video");
-  const [page, setPage] = useState(1);
-  const [totalPages, setTotalPages] = useState(10);
-  const [jobs, setJobs] = useState<MemeJob[]>([]);
+/**
+ * Video memes are capped at 10 initially ("currently only for 10") — the
+ * user can unlock 10 more on demand whenever they want to go further.
+ */
+const INITIAL_VIDEO_LIMIT = 10;
+
+interface MemeState {
+  status: "idle" | "generating" | "rendering" | "video" | "text" | "error";
+  caption?: string;
+  ttsScript?: string;
+  imageContext?: string;
+  videoUrl?: string;
+  source?: string;
+  error?: string;
+}
+
+export default function CommentAnalyzerPage() {
+  const [url, setUrl] = useState("");
   const [loading, setLoading] = useState(false);
+  const [analyzing, setAnalyzing] = useState(false);
   const [error, setError] = useState("");
-  const [mockMode, setMockMode] = useState(false);
-  const [hasSearched, setHasSearched] = useState(false);
+  const [flash, setFlash] = useState("");
+  const [section, setSection] = useState<CommentSectionResult | null>(null);
+  const [analyses, setAnalyses] = useState<Map<number, CommentAnalysis> | null>(
+    null
+  );
+  const [analysisMeta, setAnalysisMeta] = useState<{
+    llmCalls: number;
+    batches: number;
+    usedLLM: boolean;
+  } | null>(null);
+  const [memes, setMemes] = useState<Map<number, MemeState>>(new Map());
+  const [videoLimit, setVideoLimit] = useState(INITIAL_VIDEO_LIMIT);
+  const [tab, setTab] = useState<"tree" | "funny">("tree");
 
-  async function runSearch(q: string, t: ContentType, p: number) {
+  const funnyRanked = useMemo(() => {
+    if (!section || !analyses) return [];
+    return section.comments
+      .map((c) => ({ c, a: analyses.get(c.index) }))
+      .filter((x): x is { c: FlatComment; a: CommentAnalysis } => !!x.a)
+      .sort((x, y) => y.a.funnyScore - x.a.funnyScore);
+  }, [section, analyses]);
+
+  const galiCount = useMemo(() => {
+    if (!analyses) return 0;
+    let n = 0;
+    analyses.forEach((a) => a.isGali && n++);
+    return n;
+  }, [analyses]);
+
+  async function runAnalysis(comments: FlatComment[]) {
+    setAnalyzing(true);
+    try {
+      const res = await fetch("/api/analyze-comments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ comments }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "analysis failed");
+      const map = new Map<number, CommentAnalysis>();
+      for (const a of json.analyses as CommentAnalysis[]) map.set(a.index, a);
+      setAnalyses(map);
+      setAnalysisMeta({
+        llmCalls: json.llmCalls,
+        batches: json.batches,
+        usedLLM: json.usedLLM,
+      });
+    } catch (err: any) {
+      setError(err?.message || "analysis failed");
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!url.trim() || loading) return;
     setLoading(true);
     setError("");
+    setFlash("");
+    setSection(null);
+    setAnalyses(null);
+    setAnalysisMeta(null);
+    setMemes(new Map());
+    setVideoLimit(INITIAL_VIDEO_LIMIT);
     try {
-      const res = await fetch(
-        `/api/search?query=${encodeURIComponent(q)}&type=${t}&page=${p}`
-      );
+      const res = await fetch("/api/comments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
       const json = await res.json();
-      if (!res.ok) throw new Error(json.error || "search failed");
-      setJobs(json.jobs);
-      setTotalPages(json.totalPages);
-      setMockMode(json.mockMode);
-      setHasSearched(true);
+      if (!res.ok) throw new Error(json.error || "failed to load comments");
+      const result = json as CommentSectionResult;
+      setSection(result);
+      if (result.message) {
+        // zero comments — flash it, nothing to analyze
+        setFlash(result.message);
+      } else {
+        setTab("tree");
+        await runAnalysis(result.comments);
+      }
     } catch (err: any) {
       setError(err?.message || "something went wrong");
-      setJobs([]);
     } finally {
       setLoading(false);
     }
   }
 
-  function handleSearch(q: string, t: ContentType) {
-    setQuery(q);
-    setType(t);
-    setPage(1);
-    runSearch(q, t, 1);
+  function setMeme(index: number, state: MemeState) {
+    setMemes((prev) => {
+      const next = new Map(prev);
+      next.set(index, state);
+      return next;
+    });
   }
 
-  function handlePageChange(p: number) {
-    setPage(p);
-    runSearch(query, type, p);
+  async function makeMeme(c: FlatComment, wantVideo: boolean) {
+    if (!section) return;
+    setMeme(c.index, { status: "generating" });
+    try {
+      // LLM call #2: funny content generation for this comment.
+      const genRes = await fetch("/api/generate-funny", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          comment: c.text,
+          videoTitle: section.video.title,
+          thumbnailUrl: section.video.isMock
+            ? undefined
+            : section.video.thumbnail,
+        }),
+      });
+      const gen = await genRes.json();
+      if (!genRes.ok) throw new Error(gen.error || "generation failed");
+
+      if (!wantVideo) {
+        setMeme(c.index, { status: "text", ...gen });
+        return;
+      }
+
+      setMeme(c.index, { status: "rendering", ...gen });
+      const renderRes = await fetch("/api/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: `analyzer_${section.video.id}_${c.index}`,
+          caption: gen.caption,
+          thumbnailUrl: section.video.thumbnail,
+          isMockThumbnail: section.video.isMock,
+          ttsScript: gen.ttsScript,
+          colorSeedIndex: c.index,
+        }),
+      });
+      const render = await renderRes.json();
+      if (renderRes.ok && render.url) {
+        setMeme(c.index, { status: "video", ...gen, videoUrl: render.url });
+      } else {
+        // rendering unavailable -> degrade to TEXT format meme
+        setMeme(c.index, { status: "text", ...gen });
+      }
+    } catch (err: any) {
+      setMeme(c.index, {
+        status: "error",
+        error: err?.message || "meme generation failed",
+      });
+    }
   }
 
   return (
-    <main className="max-w-7xl mx-auto px-4 py-10">
+    <main className="max-w-5xl mx-auto px-4 py-10">
       <div className="text-center mb-8">
         <h1 className="text-3xl sm:text-4xl font-extrabold bg-gradient-to-r from-accent to-accent2 bg-clip-text text-transparent">
-          YouTube Meme Generator
+          YouTube Comment Analyzer
         </h1>
         <p className="text-white/50 mt-2 text-sm">
-          Search a topic, we find the funniest comments and turn them into
-          video memes.
+          Paste any YouTube video or Shorts link — we skip the video and go
+          straight to the comment section: full nested tree, LLM funniness +
+          gali analysis (50 comments per call), and meme generation.
         </p>
+        <a
+          href="/memes"
+          className="text-accent text-xs underline mt-2 inline-block"
+        >
+          → topic-search meme generator
+        </a>
       </div>
 
-      <SearchBar onSearch={handleSearch} loading={loading} />
-
-      {mockMode && hasSearched && (
-        <p className="text-center text-xs text-yellow-400/80 mt-4">
-          Running in demo mode (no YOUTUBE_API_KEY / GROQ_API_KEY set) —
-          showing generated mock videos, comments, and captions.
-        </p>
-      )}
+      <form onSubmit={handleSubmit} className="flex gap-2 max-w-2xl mx-auto">
+        <input
+          type="text"
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          placeholder="https://www.youtube.com/watch?v=...  or  youtube.com/shorts/..."
+          className="flex-1 bg-white/5 border border-white/15 rounded-xl px-4 py-3 text-sm outline-none focus:border-accent placeholder:text-white/25"
+        />
+        <button
+          type="submit"
+          disabled={loading || analyzing}
+          className="bg-gradient-to-r from-accent to-accent2 rounded-xl px-6 py-3 text-sm font-semibold disabled:opacity-40"
+        >
+          {loading ? "Loading..." : "Analyze"}
+        </button>
+      </form>
 
       {error && (
         <p className="text-center text-sm text-red-400 mt-6">{error}</p>
       )}
 
-      {loading && (
-        <p className="text-center text-white/50 mt-10">
-          Fetching top results for "{query}"...
-        </p>
-      )}
-
-      {!loading && hasSearched && !error && (
-        <div className="mt-10">
-          <MemeGrid jobs={jobs} />
-          <Pagination
-            page={page}
-            totalPages={totalPages}
-            onChange={handlePageChange}
-            disabled={loading}
-          />
+      {flash && (
+        <div className="text-center mt-10">
+          <p className="inline-block bg-yellow-500/15 text-yellow-300 border border-yellow-500/30 rounded-xl px-6 py-4 text-lg font-semibold animate-pulse">
+            {flash}
+          </p>
         </div>
       )}
 
-      {!hasSearched && !loading && (
+      {section?.mockMode && (
+        <p className="text-center text-xs text-yellow-400/80 mt-4">
+          Demo mode (no YOUTUBE_API_KEY) — showing a generated mock comment
+          section for this link.
+        </p>
+      )}
+
+      {section && !flash && (
+        <div className="mt-8">
+          <div className="flex items-center gap-4 bg-white/5 border border-white/10 rounded-xl p-4">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={section.video.thumbnail}
+              alt=""
+              className="w-24 h-16 object-cover rounded-lg"
+            />
+            <div className="min-w-0">
+              <p className="font-semibold truncate">{section.video.title}</p>
+              <p className="text-xs text-white/40">
+                {section.video.channelTitle} · {section.totalTopLevel} comments
+                · {section.totalWithReplies - section.totalTopLevel} nested
+                replies · {section.totalWithReplies} total
+              </p>
+              {analysisMeta && (
+                <p className="text-xs text-accent/80 mt-1">
+                  Analyzed in {analysisMeta.batches} batch
+                  {analysisMeta.batches > 1 ? "es" : ""} of ≤50 →{" "}
+                  {analysisMeta.usedLLM
+                    ? `${analysisMeta.llmCalls} Groq LLM call${
+                        analysisMeta.llmCalls > 1 ? "s" : ""
+                      } (LangChain)`
+                    : "heuristic fallback (no GROQ key)"}{" "}
+                  · {galiCount} gali/abusive flagged
+                </p>
+              )}
+            </div>
+          </div>
+
+          {analyzing && (
+            <p className="text-center text-white/50 mt-6 animate-pulse">
+              Running LLM analysis in batches of 50 comments...
+            </p>
+          )}
+
+          {!analyzing && (
+            <>
+              <div className="flex gap-2 mt-6">
+                <button
+                  onClick={() => setTab("tree")}
+                  className={`px-4 py-2 rounded-lg text-sm ${
+                    tab === "tree"
+                      ? "bg-accent/20 text-accent border border-accent/40"
+                      : "bg-white/5 text-white/50 border border-white/10"
+                  }`}
+                >
+                  Comment Tree ({section.totalWithReplies})
+                </button>
+                <button
+                  onClick={() => setTab("funny")}
+                  disabled={!analyses}
+                  className={`px-4 py-2 rounded-lg text-sm disabled:opacity-40 ${
+                    tab === "funny"
+                      ? "bg-accent/20 text-accent border border-accent/40"
+                      : "bg-white/5 text-white/50 border border-white/10"
+                  }`}
+                >
+                  Funny Board → Memes
+                </button>
+              </div>
+
+              {tab === "tree" && (
+                <div className="mt-4">
+                  <CommentTreeView
+                    comments={section.comments}
+                    analyses={analyses}
+                  />
+                </div>
+              )}
+
+              {tab === "funny" && analyses && (
+                <div className="mt-4 space-y-3">
+                  <p className="text-xs text-white/40">
+                    Ranked by LLM funniness. Video generation is enabled for
+                    the top {videoLimit} — unlock more on demand below. If
+                    video rendering isn't available, the meme is delivered in
+                    text format instead.
+                  </p>
+                  {funnyRanked.map(({ c, a }, rank) => {
+                    const meme = memes.get(c.index);
+                    const videoAllowed = rank < videoLimit;
+                    return (
+                      <div
+                        key={c.id}
+                        className="bg-white/5 border border-white/10 rounded-xl p-4"
+                      >
+                        <div className="flex flex-wrap items-center gap-2 text-xs text-white/40">
+                          <span className="font-mono text-accent">
+                            #{rank + 1}
+                          </span>
+                          <span className="bg-green-500/20 text-green-300 px-1.5 py-0.5 rounded">
+                            😂 {a.funnyScore}/10
+                          </span>
+                          <span
+                            className={`px-1.5 py-0.5 rounded ${
+                              a.isGali
+                                ? "bg-red-500/20 text-red-300"
+                                : "bg-white/10 text-white/40"
+                            }`}
+                          >
+                            🤬 {a.galiScore}/10
+                          </span>
+                          <span className="italic">{a.reason}</span>
+                        </div>
+                        <p className="text-sm mt-2">{c.text}</p>
+
+                        <div className="flex gap-2 mt-3">
+                          {(!meme ||
+                            meme.status === "idle" ||
+                            meme.status === "error") && (
+                            <>
+                              {videoAllowed && (
+                                <button
+                                  onClick={() => makeMeme(c, true)}
+                                  className="text-xs bg-gradient-to-r from-accent to-accent2 rounded-lg px-3 py-1.5 font-semibold"
+                                >
+                                  🎬 Make video meme
+                                </button>
+                              )}
+                              <button
+                                onClick={() => makeMeme(c, false)}
+                                className="text-xs bg-white/10 rounded-lg px-3 py-1.5"
+                              >
+                                📝 Text meme
+                              </button>
+                            </>
+                          )}
+                          {meme?.status === "generating" && (
+                            <span className="text-xs text-white/50 animate-pulse">
+                              Generating funny content (LLM call #2)...
+                            </span>
+                          )}
+                          {meme?.status === "rendering" && (
+                            <span className="text-xs text-white/50 animate-pulse">
+                              Rendering video + audio (ffmpeg)...
+                            </span>
+                          )}
+                        </div>
+
+                        {meme?.status === "error" && (
+                          <p className="text-xs text-red-400 mt-2">
+                            {meme.error}
+                          </p>
+                        )}
+
+                        {(meme?.status === "text" ||
+                          meme?.status === "video") && (
+                          <div className="mt-3 bg-black/30 rounded-lg p-3">
+                            <p className="text-sm font-semibold text-accent">
+                              {meme.caption}
+                            </p>
+                            <p className="text-xs text-white/50 mt-1">
+                              🎙 {meme.ttsScript}
+                            </p>
+                            {meme.imageContext && (
+                              <p className="text-[10px] text-white/30 mt-1">
+                                🖼 PaliGemma saw: {meme.imageContext}
+                              </p>
+                            )}
+                            <p className="text-[10px] text-white/25 mt-1">
+                              source: {meme.source}
+                              {meme.status === "text" &&
+                                " · text format (video render unavailable/not requested)"}
+                            </p>
+                            {meme.status === "video" && meme.videoUrl && (
+                              <video
+                                src={meme.videoUrl}
+                                controls
+                                className="mt-2 w-48 rounded-lg"
+                              />
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+
+                  {funnyRanked.length > videoLimit && (
+                    <div className="text-center pt-2">
+                      <button
+                        onClick={() =>
+                          setVideoLimit((v) => v + INITIAL_VIDEO_LIMIT)
+                        }
+                        className="text-xs bg-white/10 border border-white/20 rounded-lg px-4 py-2"
+                      >
+                        🔓 Unlock video generation for {INITIAL_VIDEO_LIMIT}{" "}
+                        more (on demand)
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      {!section && !loading && !error && (
         <div className="text-center text-white/30 mt-20 text-sm">
-          Enter a query above to get started.
+          Paste a link above — the video itself is skipped, only its comment
+          section is analyzed.
         </div>
       )}
     </main>

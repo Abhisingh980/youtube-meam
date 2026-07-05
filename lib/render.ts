@@ -66,13 +66,36 @@ function escapeFilterPath(p: string): string {
   return p.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\\'");
 }
 
+// Resolve a usable ffmpeg binary: FFMPEG_PATH env override, then the
+// ffmpeg-static download, then common system locations. Returns null if
+// none exists (e.g. the postinstall download was blocked) — callers treat
+// that as "video rendering unavailable" and fall back to text memes.
+function resolveFfmpeg(): string | null {
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    ffmpegPath as unknown as string,
+    "/usr/bin/ffmpeg",
+    "/usr/local/bin/ffmpeg",
+    "/opt/homebrew/bin/ffmpeg",
+  ];
+  for (const c of candidates) {
+    if (c && fs.existsSync(c)) return c;
+  }
+  return null;
+}
+
 function runFfmpeg(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (!ffmpegPath) {
-      reject(new Error("ffmpeg-static binary not found"));
+    const bin = resolveFfmpeg();
+    if (!bin) {
+      reject(
+        new Error(
+          "no ffmpeg binary available (ffmpeg-static download missing and no system ffmpeg / FFMPEG_PATH)"
+        )
+      );
       return;
     }
-    const proc = spawn(ffmpegPath as unknown as string, args);
+    const proc = spawn(bin, args);
     let stderr = "";
     proc.stderr.on("data", (d) => (stderr += d.toString()));
     proc.on("error", reject);

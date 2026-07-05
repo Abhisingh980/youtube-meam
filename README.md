@@ -1,8 +1,43 @@
-# YouTube Meme Generator
+# YouTube Comment Analyzer + Meme Generator
+
+Two tools in one Next.js 14 (App Router, TypeScript, Tailwind) app:
+
+## 1. Comment Analyzer (home page `/`) — the main feature
+
+Paste ANY YouTube video or Shorts link. The video itself is skipped — the
+app goes **straight to the comment section**:
+
+1. **Full comment tree fetch** — top-level comments AND nested replies via
+   the YouTube Data API v3 (`commentThreads`, `part=snippet,replies`,
+   paginated, capped at ~500 comments). Every top-level comment stores a
+   **thread reference** `[threadStart → threadEnd]`: the flat-index range
+   its nested thread occupies, so you always know where each nested thread
+   starts and ends. Replies carry `parentId` + `depth`.
+2. **No comments?** The UI flashes **"There is no comment on this video."**
+3. **LLM call #1 — batch analysis** (LangChain + Groq
+   `llama-3.3-70b-versatile`): comments are divided into **batches of 50,
+   one LLM call per batch** (a single model handles all batches), scoring
+   every comment for **funniness (0-10)** and **gali / abusive language
+   (0-10, English + Hindi/Hinglish)**. Any failed batch degrades to a
+   heuristic scorer so results always come back complete.
+4. **Tree-structure output** — the whole comment section rendered as a tree
+   with per-comment 😂/🤬 score badges and thread references.
+5. **LLM call #2 — funny generation**: the Funny Board ranks comments by
+   LLM funniness; each can be turned into meme content (caption +
+   voiceover script). If `NVIDIA_API_KEY` is set, the video thumbnail is
+   first described by **NVIDIA PaliGemma**
+   (`ai.api.nvidia.com/v1/vlm/google/paligemma`) and fed in as visual
+   context.
+6. **Video + audio rendering** (ffmpeg, 1080x1920 mp4 with burned-in
+   caption + audio track) — enabled for the **top 10** funny comments
+   initially; the user can **unlock 10 more on demand** whenever they want
+   to go further. If rendering isn't available, the meme is delivered in
+   **text format** instead — nothing blocks.
+
+## 2. Topic-search Meme Generator (`/memes`)
 
 Search YouTube for a topic, find the funniest comments, and generate short
-vertical "video memes" (background + burned-in caption + voiceover) — all
-built on Next.js 14 (App Router, TypeScript, Tailwind).
+vertical "video memes" (background + burned-in caption + voiceover).
 
 ## Quick start
 
@@ -19,11 +54,16 @@ files.
 
 Copy `.env.example` to `.env` and fill in any subset of:
 
-- `YOUTUBE_API_KEY` — enables real YouTube Data API v3 search + comments.
+- `YOUTUBE_API_KEY` — enables real YouTube Data API v3 search + comments
+  (including the full nested comment tree in the analyzer).
 - `GROQ_API_KEY` (or comma-separated `GROQ_API_KEYS` for multiple keys,
-  round-robin rotated) — enables real Groq-generated
-  (`llama-3.3-70b-versatile`) captions, falls back to a template
-  generator on any API error.
+  round-robin rotated) — enables real Groq LLM calls via LangChain
+  (`llama-3.3-70b-versatile`) for batch comment analysis and caption
+  generation; falls back to heuristic/template generators on any API error.
+- `NVIDIA_API_KEY` — enables PaliGemma VLM thumbnail descriptions used as
+  extra context for funny meme generation.
+- `FFMPEG_PATH` — optional explicit ffmpeg binary path if the
+  ffmpeg-static postinstall download is blocked in your environment.
 
 Audio is always a synthesized sine-wave tone via ffmpeg (no TTS provider
 is integrated). Any key that's missing degrades that one piece of the
