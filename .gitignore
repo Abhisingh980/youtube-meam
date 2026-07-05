@@ -1,0 +1,12 @@
+node_modules
+.next
+out
+build
+.env
+.env.local
+data/cache
+public/generated
+public/placeholders/*.png
+*.log
+.DS_Store
+groq.txt

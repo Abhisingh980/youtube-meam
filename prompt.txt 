@@ -1,0 +1,229 @@
+To build a bulletproof, high-speed system that extracts YouTube comments, filters them using local open-source models, and orchestrates them via LangChain and Claude into media formats, you must isolate network, compute, and model constraints.1. Exhaustive Edge-Case MatrixFailure PointSpecific Edge CaseArchitectural Mitigation StrategyYouTube Data APIComments are explicitly disabled on the video.Trap HttpError 403/404 specifically; return a graceful system exception payload instead of terminating execution.YouTube Data APIVideo ID is valid but private, deleted, or geoblocked.Intercept status codes during the initial payload handshake before spinning up the ingestion pipeline.YouTube Data APIQuota Limit Exceeded (HTTP 403).Abstract the API client behind an automated fallback pool of secondary developer keys or switch to headless scrapers (e.g., yt-dlp) as a failover.Comment IngestionComments contain heavy multi-byte emojis, Zalgo text, or mixed encodings.Force strict utf-8 normalization and strip non-printable characters via custom regex pre-processing.Comment IngestionContext Window Overflow (e.g., 1,000 long-form text comments exceed token thresholds).Truncate single comments to a strict length limit (e.g., 280 characters) during structural transformation.Local ML LayerOut-of-Memory (OOM) exceptions on local GPU during batch inference.Implement dynamic batch sizing with safety guards, processing in variable chunks based on VRAM/RAM availability.LangChain / ClaudeClaude fails to return valid, unescaped JSON for structural rendering.Force strict json schemas using modern LangChain structured output runnables (with_structured_output).Media EngineFFmpeg crashes on missing system fonts or special glyph characters.Pre-render text using an absolute fallback font asset file packaged directly inside your local application directory.2. High-Throughput System ArchitectureTo achieve maximum efficiency, the application separates Network I/O (fetching comments) from Compute-Bound Tasks (local model inference) and API Calls (Claude processing):[User Input: Video URL]
+         │
+         ▼
+ ┌───────────────┐
+ │  Async Fetch  │ ──► Loops 10x per page (100 per request) using nextPageToken
+ └───────────────┘
+         │
+         ▼
+ ┌───────────────┐
+ │ Text Cleaners │ ──► Standardizes encodings & filters empty strings
+ └───────────────┘
+         │
+         ▼
+ ┌───────────────┐
+ │ Local Model   │ ──► Batched GPU/CPU vector screening (e.g., RoBERTa humor)
+ └───────────────┘
+         │
+         ▼
+ ┌───────────────┐
+ │ LangChain     │ ──► Claude processes screened JSON via structured output
+ └───────────────┘
+         │
+         ▼
+ ┌───────────────┐
+ │ Media Engine  │ ──► Parallel FFmpeg / Edge-TTS audio-video compilation
+ └───────────────┘
+3. Production-Ready ImplementationThis production script handles pagination limits, sanitization, parallel threads, local screening, and Claude orchestration.Pythonimport os
+import re
+import asyncio
+from typing import List, Dict, Any, Optional
+from concurrent.futures import ProcessPoolExecutor
+import googleapiclient.discovery
+import googleapiclient.errors
+from pydantic import BaseModel, Field
+from transformers import pipeline
+from langchain_anthropic import ChatAnthropic
+
+# ==========================================
+# 1. DATA MODELS & STRUCTURAL SCHEMAS
+# ==========================================
+class MemeSegment(BaseModel):
+    timestamp_start: str = Field(description="Format MM:SS relative to output media")
+    timestamp_end: str = Field(description="Format MM:SS relative to output media")
+    source_comment: str = Field(description="The underlying sanitized comment text")
+    voiceover_script: str = Field(description="The voiceover text matching the user choice format")
+    visual_cue: str = Field(description="Visual direction, framing or overlay text layout instructions")
+
+class MemeScriptOutput(BaseModel):
+    media_format: str = Field(description="Target output format: audio or video")
+    narrator_persona: str = Field(description="The specific style profile or tone applied")
+    suggested_background_music: str = Field(description="Description of royalty-free pacing track matching tone")
+    segments: List[MemeSegment] = Field(description="Ordered list of comedic timestamps and scenes")
+
+# ==========================================
+# 2. SANITIZATION AND API DATA EXTRACTION
+# ==========================================
+def clean_comment_text(raw_text: str) -> str:
+    """Removes un-encodable text artifacts and standardizes whitespace."""
+    if not raw_text:
+        return ""
+    # Normalize characters, clean HTML formatting tags returned from API
+    text = re.sub(r'<br\s*/?>', '\n', raw_text)
+    text = re.sub(r'[^\x20-\x7E\n]', '', text)  # Keep printable ASCII characters
+    return text.strip()
+
+async def fetch_youtube_comments_page(video_id: str, developer_key: str, total_needed: int = 1000) -> List[str]:
+    """
+    Fetches raw text threads while navigating the API's maximum 100 per-request limit.
+    Mitigates closed comment loops, empty payloads, and permission issues.
+    """
+    def _api_call():
+        youtube = googleapiclient.discovery.build("youtube", "v3", developerKey=developer_key, cache_discovery=False)
+        collected_comments = []
+        next_page_token = None
+        
+        while len(collected_comments) < total_needed:
+            try:
+                # Max constraint allowed by YouTube endpoint is 100
+                request = youtube.commentThreads().list(
+                    part="snippet",
+                    videoId=video_id,
+                    maxResults=100,
+                    textFormat="html",
+                    pageToken=next_page_token
+                )
+                response = request.execute()
+            except googleapiclient.errors.HttpError as e:
+                # Catch closed comments (403) or missing/private videos (404)
+                if e.resp.status in [403, 404]:
+                    return collected_comments
+                raise e
+
+            for item in response.get("items", []):
+                top_comment = item["snippet"]["topLevelComment"]["snippet"]["textOriginal"]
+                cleaned = clean_comment_text(top_comment)
+                if cleaned:
+                    collected_comments.append(cleaned)
+                    
+            next_page_token = response.get("nextPageToken")
+            if not next_page_token:
+                break
+                
+        return collected_comments[:total_needed]
+
+    return await asyncio.to_thread(_api_call)
+
+# ==========================================
+# 3. COMPUTE-BOUND LOCAL SCREENING (LOCAL ML)
+# ==========================================
+def run_local_humor_screening(comments: List[str]) -> List[str]:
+    """
+    Runs a local open-source transformer model to down-sample huge arrays.
+    Saves API tokens by screening out plain or boring comments first.
+    """
+    if not comments:
+        return []
+    
+    # Utilizing an open-source sentiment or humor classification pipeline
+    # Fallback to local CPU/GPU safe mini-pipeline models
+    classifier = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", device=-1)
+    
+    screened_results = []
+    # Batch size processing minimizes model forward-pass bottlenecks
+    batch_size = 64
+    for i in range(0, len(comments), batch_size):
+        chunk = comments[i:i + batch_size]
+        # Mitigate string size explosion constraints
+        truncated_chunk = [text[:250] for text in chunk]
+        predictions = classifier(truncated_chunk)
+        
+        for idx, pred in enumerate(predictions):
+            # Filtering for extreme sentiment / higher statistical variance 
+            if pred['score'] > 0.75:
+                screened_results.append(chunk[idx])
+                
+    return screened_results
+
+# ==========================================
+# 4. ORCHESTRATION PIPELINE
+# ==========================================
+async def orchestrate_meme_generation(video_id: str, youtube_key: str, anthropic_key: str, mode: str) -> MemeScriptOutput:
+    # Step 1: Parallel/Async network extraction
+    raw_comments = await fetch_youtube_comments_page(video_id, youtube_key, total_needed=1000)
+    if not raw_comments:
+        raise ValueError("Target video contains no extractable text comments or comments are disabled.")
+        
+    # Step 2: Offload local compute processing to process pool worker to prevent blocking the async loop
+    loop = asyncio.get_running_loop()
+    with ProcessPoolExecutor() as pool:
+        screened_comments = await loop.run_in_executor(pool, run_local_humor_screening, raw_comments)
+    
+    # Absolute minimum fallback safety guard
+    if not screened_comments:
+        screened_comments = raw_comments[:50]
+        
+    # Step 3: Run structured transformation using LangChain & Claude
+    llm = ChatAnthropic(
+        model="claude-3-5-sonnet-20240620", 
+        temperature=1.0, # High variance parameter boosts comedic patterns
+        anthropic_api_key=anthropic_key
+    )
+    
+    structured_llm = llm.with_structured_output(MemeScriptOutput)
+    
+    # Inject prompt instructions directly into execution run
+    formatted_comments_payload = "\n".join([f"- {msg}" for msg in screened_comments[:100]])
+    
+    system_instruction = SYSTEM_MEME_PROMPT.format(format_choice=mode)
+    user_payload = f"Analyze these raw video comment threads and build the script execution output:\n\n{formatted_comments_payload}"
+    
+    # Combined invocation guarantees strict schema adherence
+    response = await structured_llm.ainvoke([
+        ("system", system_instruction),
+        ("human", user_payload)
+    ])
+    
+    return response
+4. Specialized Claude Meme PromptsTo ensure absolute execution safety and strict adherence to structural criteria, use these optimized system prompts.Prompt Configuration: System Engine InstructionsPlaintextVariables Required:
+- {format_choice}: Must be dynamically replaced with either 'audio' or 'video' depending on client runtime state.
+PlaintextYou are a ruthless, counter-culture comedic engine and specialized scriptwriter running in an automated production pipeline. Your task is to process a batch of social comments extracted from a video and construct a high-velocity, structured script optimized for {format_choice} compilation.
+
+The user choices dictate strict output profiles:
+- If format is 'audio': focus heavily on auditory pacing, exaggerated vocal inflections, voice delivery indicators, sound effect cues, and fast joke setups.
+- If format is 'video': provide distinct visual frame descriptions, text-on-screen overlay specs, background loop descriptions, and visual timing intervals alongside the script elements.
+
+CRITICAL EXECUTION CONSTRAINTS:
+1. Comedy Directive: Avoid generic cliches, corporate voice-over tropes, or overly sanitized summaries. Lean heavily into situational irony, absurdist meta-humor, dry sarcasm, and the unique internet subculture reflected within the target community.
+2. structural Blueprinting: Break the narrative up sequentially. Ensure timestamps are continuous and increment realistically based on the pace of the output script.
+3. Content Integration: Every script block must trace explicitly back to the thematic or literal anchor of a source comment. Do not hallucinate completely detached topics.
+4. Formatting Invariant: Do not append text formatting, conversational intros, or post-response notes. Your response must resolve cleanly into the requested data layout structure.
+Prompt Configuration: Fallback Safe Content StructuringIf your implementation handles raw unstructured text fallback routing (e.g., parsing raw markdown string streams instead of Pydantic-based runnables), supply this system layout template:PlaintextTransform the provided comment inputs directly into a clean, parseable JSON array. The structured response must strictly adhere to this exact structural block format:
+
+{{
+  "media_format": "{format_choice}",
+  "narrator_persona": "An unhinged, deadpan AI archetype breaking down human behaviors",
+  "suggested_background_music": "Low-fidelity jazz hip-hop beat laced with intentional vinyl record scratch artifacts",
+  "segments": [
+    {{
+      "timestamp_start": "00:00",
+      "timestamp_end": "00:12",
+      "source_comment": "Literal text payload string from user input list",
+      "voiceover_script": "The spoken narrative script text for processing engine compilation",
+      "visual_cue": "Exact directions for visual canvas background generation, typography, and video transitions"
+    }}
+  ]
+}}
+
+Ensure that special character sets are escaped cleanly according to strict JSON transport protocols.
+5. Media Compilation Pipeline (FFmpeg Integration)Once Claude returns the structured output, route the strings into an automated script wrapper using edge-tts (fast, free open-source TTS) and ffmpeg to build the final media without manual rendering overhead:Pythonimport subprocess
+
+def compile_video_frame(audio_path: str, text_overlay: str, output_path: str):
+    """
+    Generates a video clip by overlaying the script text over a dark base 
+    canvas, paired with the spoken comment track.
+    """
+    # Escape characters for safe shell pipeline processing
+    escaped_text = text_overlay.replace("'", "'\\''")
+    
+    cmd = [
+        'ffmpeg', '-y',
+        '-f', 'lavfi', '-i', 'color=c=0x111111:s=1080x1920:r=30', # Create a clean 1080x1920 portrait canvas (Shorts/Reels)
+        '-i', audio_path, # Inject the spoken voice file
+        '-vf', f"drawtext=text='{escaped_text}':fontcolor=white:fontsize=48:x=(w-text_w)/2:y=(h-text_h)/2:word_wrap=1",
+        '-c:v', 'libx264', '-tune', 'stillimage',
+        '-c:a', 'aac', '-b:a', '192k',
+        '-shortest', output_path # Truncate video immediately when audio track completes
+    ]
+    
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
