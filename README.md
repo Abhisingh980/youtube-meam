@@ -22,17 +22,32 @@ app goes **straight to the comment section**:
    heuristic scorer so results always come back complete.
 4. **Tree-structure output** — the whole comment section rendered as a tree
    with per-comment 😂/🤬 score badges and thread references.
-5. **LLM call #2 — funny generation**: the Funny Board ranks comments by
-   LLM funniness; each can be turned into meme content (caption +
-   voiceover script). If `NVIDIA_API_KEY` is set, the video thumbnail is
-   first described by **NVIDIA PaliGemma**
-   (`ai.api.nvidia.com/v1/vlm/google/paligemma`) and fed in as visual
-   context.
-6. **Video + audio rendering** (ffmpeg, 1080x1920 mp4 with burned-in
-   caption + audio track) — enabled for the **top 10** funny comments
-   initially; the user can **unlock 10 more on demand** whenever they want
-   to go further. If rendering isn't available, the meme is delivered in
-   **text format** instead — nothing blocks.
+5. **English → Hindi translation section** — one click translates the
+   **exact text of every comment in the tree** to Hindi (Devanagari) via
+   Groq/LangChain, batched 50 comments per LLM call. This is a faithful
+   translation (nothing rewritten) and is never mocked — without a Groq
+   key the UI says so instead of showing fake translations. Toggle between
+   English and Hindi views of the same tree.
+6. **LLM call #2 — funny generation**: the Funny Board ranks comments by
+   LLM funniness. The comment is used as **context only** — the LLM writes
+   ORIGINAL meaningful funny content (caption + voiceover script + a
+   text-to-video scene prompt), never copying the comment letter-for-letter.
+   If `NVIDIA_API_KEY` is set, the video thumbnail is first described by
+   **NVIDIA PaliGemma** (`ai.api.nvidia.com/v1/vlm/google/paligemma`) and
+   fed in as visual context.
+7. **Generative video / funny audio / text — user's choice per comment**:
+   - **Video**: looks generative, not a static lettered card. Background
+     priority: (a) a REAL text-to-video API (`VIDEO_GEN_API_URL/KEY`,
+     e.g. MiniMax/Hailuo or Runway) fed the LLM's videoPrompt; (b) the
+     thumbnail animated with ken-burns zoom + hue drift; (c) a procedural
+     animated multi-color gradient. 1080x1920, 8s, burned-in caption.
+   - **Audio**: real spoken voiceover via ElevenLabs TTS
+     (`ELEVENLABS_API_KEY`, multilingual — Hindi works) or a placeholder
+     tone without a key.
+   - Video generation is enabled for the **top 10** funny comments
+     initially; **unlock 10 more on demand** whenever you want to go
+     further. If rendering isn't available, the meme is delivered in
+     **text format** instead — nothing blocks.
 
 ## 2. Topic-search Meme Generator (`/memes`)
 

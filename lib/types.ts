@@ -89,8 +89,14 @@ export interface CommentSectionResult {
 }
 
 export interface FunnyGeneration {
+  /** ORIGINAL funny content written by the LLM — the source comment is
+   * used only as context/inspiration, never copied letter-for-letter. */
   caption: string;
   ttsScript: string;
+  /** generative-AI scene prompt derived from the comment — fed to the
+   * video generator (real text-to-video API if configured, otherwise the
+   * procedural animated ffmpeg renderer). */
+  videoPrompt: string;
   source: "groq" | "template";
   /** optional NVIDIA PaliGemma description of the video thumbnail */
   imageContext?: string;

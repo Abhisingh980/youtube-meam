@@ -15,14 +15,27 @@ import {
 const INITIAL_VIDEO_LIMIT = 10;
 
 interface MemeState {
-  status: "idle" | "generating" | "rendering" | "video" | "text" | "error";
+  status:
+    | "idle"
+    | "generating"
+    | "rendering"
+    | "video"
+    | "audio"
+    | "text"
+    | "error";
   caption?: string;
   ttsScript?: string;
+  videoPrompt?: string;
   imageContext?: string;
   videoUrl?: string;
+  audioUrl?: string;
+  backgroundSource?: string;
+  realVoice?: boolean;
   source?: string;
   error?: string;
 }
+
+type MemeMode = "video" | "audio" | "text";
 
 export default function CommentAnalyzerPage() {
   const [url, setUrl] = useState("");
@@ -42,6 +55,13 @@ export default function CommentAnalyzerPage() {
   const [memes, setMemes] = useState<Map<number, MemeState>>(new Map());
   const [videoLimit, setVideoLimit] = useState(INITIAL_VIDEO_LIMIT);
   const [tab, setTab] = useState<"tree" | "funny">("tree");
+  const [lang, setLang] = useState<"en" | "hi">("en");
+  const [translations, setTranslations] = useState<Record<
+    number,
+    string
+  > | null>(null);
+  const [translating, setTranslating] = useState(false);
+  const [translateNote, setTranslateNote] = useState("");
 
   const funnyRanked = useMemo(() => {
     if (!section || !analyses) return [];
@@ -94,6 +114,9 @@ export default function CommentAnalyzerPage() {
     setAnalysisMeta(null);
     setMemes(new Map());
     setVideoLimit(INITIAL_VIDEO_LIMIT);
+    setTranslations(null);
+    setTranslateNote("");
+    setLang("en");
     try {
       const res = await fetch("/api/comments", {
         method: "POST",
@@ -118,6 +141,45 @@ export default function CommentAnalyzerPage() {
     }
   }
 
+  async function handleTranslate() {
+    if (!section || translating) return;
+    // toggle back to English without refetching
+    if (lang === "hi") {
+      setLang("en");
+      return;
+    }
+    if (translations) {
+      setLang("hi");
+      return;
+    }
+    setTranslating(true);
+    setTranslateNote("");
+    try {
+      const res = await fetch("/api/translate-comments", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ comments: section.comments }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "translation failed");
+      if (!json.translations) {
+        setTranslateNote(json.message || "Translation unavailable.");
+        return;
+      }
+      setTranslations(json.translations);
+      setLang("hi");
+      setTranslateNote(
+        `Translated exactly, ${json.batches} batch${
+          json.batches > 1 ? "es" : ""
+        } of ≤50 → ${json.llmCalls} LLM call${json.llmCalls > 1 ? "s" : ""}`
+      );
+    } catch (err: any) {
+      setTranslateNote(err?.message || "translation failed");
+    } finally {
+      setTranslating(false);
+    }
+  }
+
   function setMeme(index: number, state: MemeState) {
     setMemes((prev) => {
       const next = new Map(prev);
@@ -126,11 +188,12 @@ export default function CommentAnalyzerPage() {
     });
   }
 
-  async function makeMeme(c: FlatComment, wantVideo: boolean) {
+  async function makeMeme(c: FlatComment, mode: MemeMode) {
     if (!section) return;
     setMeme(c.index, { status: "generating" });
     try {
-      // LLM call #2: funny content generation for this comment.
+      // LLM call #2: ORIGINAL funny content — the comment is context only,
+      // never copied letter-for-letter into the meme.
       const genRes = await fetch("/api/generate-funny", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -145,27 +208,44 @@ export default function CommentAnalyzerPage() {
       const gen = await genRes.json();
       if (!genRes.ok) throw new Error(gen.error || "generation failed");
 
-      if (!wantVideo) {
+      if (mode === "text") {
         setMeme(c.index, { status: "text", ...gen });
         return;
       }
 
       setMeme(c.index, { status: "rendering", ...gen });
-      const renderRes = await fetch("/api/render", {
+      const renderRes = await fetch("/api/render-meme", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          id: `analyzer_${section.video.id}_${c.index}`,
+          kind: mode,
+          id: `analyzer_${section.video.id}_${c.index}_${mode}`,
           caption: gen.caption,
+          ttsScript: gen.ttsScript,
+          videoPrompt: gen.videoPrompt,
           thumbnailUrl: section.video.thumbnail,
           isMockThumbnail: section.video.isMock,
-          ttsScript: gen.ttsScript,
           colorSeedIndex: c.index,
         }),
       });
       const render = await renderRes.json();
       if (renderRes.ok && render.url) {
-        setMeme(c.index, { status: "video", ...gen, videoUrl: render.url });
+        if (mode === "audio") {
+          setMeme(c.index, {
+            status: "audio",
+            ...gen,
+            audioUrl: render.url,
+            realVoice: render.realVoice,
+          });
+        } else {
+          setMeme(c.index, {
+            status: "video",
+            ...gen,
+            videoUrl: render.url,
+            backgroundSource: render.backgroundSource,
+            realVoice: render.realVoice,
+          });
+        }
       } else {
         // rendering unavailable -> degrade to TEXT format meme
         setMeme(c.index, { status: "text", ...gen });
@@ -298,9 +378,34 @@ export default function CommentAnalyzerPage() {
 
               {tab === "tree" && (
                 <div className="mt-4">
+                  <div className="flex flex-wrap items-center gap-3 mb-3">
+                    <button
+                      onClick={handleTranslate}
+                      disabled={translating}
+                      className="text-xs bg-white/10 border border-white/20 rounded-lg px-4 py-2 disabled:opacity-40"
+                    >
+                      {translating
+                        ? "Translating exact comments (batches of 50)..."
+                        : lang === "hi"
+                          ? "🔤 Show English (original)"
+                          : "🇮🇳 अनुवाद — translate tree to Hindi"}
+                    </button>
+                    {lang === "hi" && (
+                      <span className="text-xs text-accent/80">
+                        Showing exact Hindi translation of every comment
+                      </span>
+                    )}
+                    {translateNote && (
+                      <span className="text-xs text-white/40">
+                        {translateNote}
+                      </span>
+                    )}
+                  </div>
                   <CommentTreeView
                     comments={section.comments}
                     analyses={analyses}
+                    translations={translations}
+                    lang={lang}
                   />
                 </div>
               )}
@@ -308,10 +413,11 @@ export default function CommentAnalyzerPage() {
               {tab === "funny" && analyses && (
                 <div className="mt-4 space-y-3">
                   <p className="text-xs text-white/40">
-                    Ranked by LLM funniness. Video generation is enabled for
-                    the top {videoLimit} — unlock more on demand below. If
-                    video rendering isn't available, the meme is delivered in
-                    text format instead.
+                    Ranked by LLM funniness. The comment is used as CONTEXT
+                    only — the LLM writes original funny content, then renders
+                    it as a generative video, funny audio, or text (your
+                    choice). Video generation is enabled for the top{" "}
+                    {videoLimit} — unlock more on demand below.
                   </p>
                   {funnyRanked.map(({ c, a }, rank) => {
                     const meme = memes.get(c.index);
@@ -341,21 +447,27 @@ export default function CommentAnalyzerPage() {
                         </div>
                         <p className="text-sm mt-2">{c.text}</p>
 
-                        <div className="flex gap-2 mt-3">
+                        <div className="flex flex-wrap gap-2 mt-3">
                           {(!meme ||
                             meme.status === "idle" ||
                             meme.status === "error") && (
                             <>
                               {videoAllowed && (
                                 <button
-                                  onClick={() => makeMeme(c, true)}
+                                  onClick={() => makeMeme(c, "video")}
                                   className="text-xs bg-gradient-to-r from-accent to-accent2 rounded-lg px-3 py-1.5 font-semibold"
                                 >
-                                  🎬 Make video meme
+                                  🎬 Generative video
                                 </button>
                               )}
                               <button
-                                onClick={() => makeMeme(c, false)}
+                                onClick={() => makeMeme(c, "audio")}
+                                className="text-xs bg-white/10 rounded-lg px-3 py-1.5"
+                              >
+                                🎙 Funny audio
+                              </button>
+                              <button
+                                onClick={() => makeMeme(c, "text")}
                                 className="text-xs bg-white/10 rounded-lg px-3 py-1.5"
                               >
                                 📝 Text meme
@@ -364,12 +476,13 @@ export default function CommentAnalyzerPage() {
                           )}
                           {meme?.status === "generating" && (
                             <span className="text-xs text-white/50 animate-pulse">
-                              Generating funny content (LLM call #2)...
+                              Writing original funny content (comment used as
+                              context, LLM call #2)...
                             </span>
                           )}
                           {meme?.status === "rendering" && (
                             <span className="text-xs text-white/50 animate-pulse">
-                              Rendering video + audio (ffmpeg)...
+                              Rendering generative video/audio...
                             </span>
                           )}
                         </div>
@@ -381,7 +494,8 @@ export default function CommentAnalyzerPage() {
                         )}
 
                         {(meme?.status === "text" ||
-                          meme?.status === "video") && (
+                          meme?.status === "video" ||
+                          meme?.status === "audio") && (
                           <div className="mt-3 bg-black/30 rounded-lg p-3">
                             <p className="text-sm font-semibold text-accent">
                               {meme.caption}
@@ -389,21 +503,44 @@ export default function CommentAnalyzerPage() {
                             <p className="text-xs text-white/50 mt-1">
                               🎙 {meme.ttsScript}
                             </p>
+                            {meme.videoPrompt && (
+                              <p className="text-[10px] text-white/35 mt-1">
+                                🎥 video prompt: {meme.videoPrompt}
+                              </p>
+                            )}
                             {meme.imageContext && (
                               <p className="text-[10px] text-white/30 mt-1">
                                 🖼 PaliGemma saw: {meme.imageContext}
                               </p>
                             )}
                             <p className="text-[10px] text-white/25 mt-1">
-                              source: {meme.source}
+                              source: {meme.source} · original content —
+                              comment used as context only
                               {meme.status === "text" &&
-                                " · text format (video render unavailable/not requested)"}
+                                " · text format (render unavailable/not requested)"}
+                              {meme.status === "video" &&
+                                meme.backgroundSource &&
+                                ` · background: ${meme.backgroundSource}`}
+                              {(meme.status === "video" ||
+                                meme.status === "audio") &&
+                                ` · voice: ${
+                                  meme.realVoice
+                                    ? "real TTS"
+                                    : "placeholder tone (add ELEVENLABS_API_KEY)"
+                                }`}
                             </p>
                             {meme.status === "video" && meme.videoUrl && (
                               <video
                                 src={meme.videoUrl}
                                 controls
                                 className="mt-2 w-48 rounded-lg"
+                              />
+                            )}
+                            {meme.status === "audio" && meme.audioUrl && (
+                              <audio
+                                src={meme.audioUrl}
+                                controls
+                                className="mt-2 w-full max-w-xs"
                               />
                             )}
                           </div>

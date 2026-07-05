@@ -1,10 +1,14 @@
 "use client";
 
-import { AnalyzedComment, FlatComment, CommentAnalysis } from "@/lib/types";
+import { FlatComment, CommentAnalysis } from "@/lib/types";
 
 interface Props {
   comments: FlatComment[];
   analyses: Map<number, CommentAnalysis> | null;
+  /** exact Hindi translations keyed by flat comment index */
+  translations?: Record<number, string> | null;
+  /** which language to display comment text in */
+  lang?: "en" | "hi";
 }
 
 function ScoreBadge({ a }: { a: CommentAnalysis }) {
@@ -45,12 +49,20 @@ function ScoreBadge({ a }: { a: CommentAnalysis }) {
  * thread reference [#start → #end] — the flat-index range its nested
  * thread occupies — exactly as stored by the fetcher.
  */
-export default function CommentTreeView({ comments, analyses }: Props) {
+export default function CommentTreeView({
+  comments,
+  analyses,
+  translations,
+  lang = "en",
+}: Props) {
   return (
     <div className="space-y-1 text-sm">
       {comments.map((c) => {
         const a = analyses?.get(c.index) || null;
         const isTop = c.depth === 0;
+        const hindi = translations?.[c.index];
+        const displayText = lang === "hi" && hindi ? hindi : c.text;
+        const missingTranslation = lang === "hi" && !hindi;
         return (
           <div
             key={c.id}
@@ -81,7 +93,15 @@ export default function CommentTreeView({ comments, analyses }: Props) {
               {a && <ScoreBadge a={a} />}
             </div>
             <p className="text-white/85 mt-1 whitespace-pre-wrap break-words">
-              {c.text}
+              {displayText}
+              {missingTranslation && (
+                <span
+                  className="text-white/25 text-xs ml-1"
+                  title="translation unavailable for this comment — showing original"
+                >
+                  (मूल)
+                </span>
+              )}
             </p>
           </div>
         );
